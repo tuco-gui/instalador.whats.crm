@@ -13,7 +13,6 @@ _run_as_deploy() {
 
 #######################################
 # instala dependências do frontend
-# Arguments: None
 #######################################
 frontend_node_dependencies() {
   print_banner
@@ -22,7 +21,6 @@ frontend_node_dependencies() {
 
   _run_as_deploy "
     cd /home/deploy/${instancia_add}/frontend
-    # use npm ci se tiver package-lock.json; caso contrário, npm install
     if [ -f package-lock.json ]; then
       npm ci --force
     else
@@ -35,7 +33,6 @@ frontend_node_dependencies() {
 
 #######################################
 # compila o frontend
-# Arguments: None
 #######################################
 frontend_node_build() {
   print_banner
@@ -51,8 +48,7 @@ frontend_node_build() {
 }
 
 #######################################
-# atualiza o frontend (git pull + build + pm2 reload)
-# Arguments: None
+# atualiza o frontend
 #######################################
 frontend_update() {
   print_banner
@@ -80,19 +76,17 @@ frontend_update() {
 
 #######################################
 # cria .env e server.js do frontend
-# Arguments: None
 #######################################
 frontend_set_env() {
   print_banner
   printf "${WHITE} 💻 Configurando variáveis de ambiente (frontend)...${GRAY_LIGHT}\n\n"
   sleep 2
 
-  # normaliza backend_url => https://dominio
   backend_url=$(echo "${backend_url/https:\/\/}")
   backend_url=${backend_url%%/*}
   backend_url="https://${backend_url}"
 
-  # .env (sem espaços ao redor de '=')
+  # .env
   _run_as_deploy "
     cat > /home/deploy/${instancia_add}/frontend/.env <<'EOFENV'
 REACT_APP_BACKEND_URL=${backend_url}
@@ -121,18 +115,15 @@ EOFSRV
 }
 
 #######################################
-# inicia pm2 do frontend (como deploy)
-# Arguments: None
+# inicia pm2 do frontend
 #######################################
 frontend_start_pm2() {
   print_banner
   printf "${WHITE} 💻 Iniciando pm2 (frontend)...${GRAY_LIGHT}\n\n"
   sleep 2
 
-  # garante pasta do pm2
   _run_as_deploy "mkdir -p /home/deploy/.pm2"
 
-  # cria serviço do pm2 para o usuário deploy apenas se ainda não existir
   if [ ! -f /etc/systemd/system/pm2-deploy.service ]; then
     sudo env PATH=$PATH:/usr/bin \
       /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u deploy --hp /home/deploy >/dev/null
@@ -144,7 +135,6 @@ frontend_start_pm2() {
     pm2 save
   "
 
-  # habilita e sobe o serviço (idempotente)
   sudo systemctl enable pm2-deploy.service >/dev/null 2>&1 || true
   sudo systemctl start  pm2-deploy.service >/dev/null 2>&1 || true
 
@@ -153,7 +143,6 @@ frontend_start_pm2() {
 
 #######################################
 # configura nginx (frontend)
-# Arguments: None
 #######################################
 frontend_nginx_setup() {
   print_banner
@@ -171,7 +160,7 @@ server {
     proxy_pass http://127.0.0.1:${frontend_port};
     proxy_http_version 1.1;
     proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection 'upgrade';
+    proxy_set_header Connection \"upgrade\";
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
     proxy_set_header X-Forwarded-Proto \$scheme;
@@ -187,3 +176,4 @@ nginx -t && systemctl reload nginx
 
   sleep 2
 }
+
