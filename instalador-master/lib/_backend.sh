@@ -1,61 +1,82 @@
 #!/bin/bash
 #
 # functions for setting up app backend
-#######################################
-# creates REDIS db using docker
-# Arguments:
-#   None
-#######################################
-backend_redis_create() {
-  print_banner
-  printf "${WHITE} 💻 Criando Redis & Banco Postgres...${GRAY_LIGHT}"
-  printf "\n\n"
 
-  sleep 2
-
-  sudo su - root <<EOF
-  usermod -aG docker deploy
-  docker run --name redis-${instancia_add} -p ${redis_port}:6379 --restart always --detach redis redis-server --requirepass ${mysql_root_password}
-
-  sleep 2
-  sudo su - postgres <<EOF
-    createdb ${instancia_add};
-    psql
-    CREATE USER ${instancia_add} SUPERUSER INHERIT CREATEDB CREATEROLE;
-    ALTER USER ${instancia_add} PASSWORD '${mysql_root_password}';
-    \q
-    exit
-EOF
-
-sleep 2
-
+# Helper: executa como deploy com HOME/PM2_HOME corretos
+_run_as_deploy() {
+  sudo -u deploy -H env \
+    HOME=/home/deploy \
+    PM2_HOME=/home/deploy/.pm2 \
+    PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    bash -lc "$*"
 }
 
 #######################################
-# sets environment variable for backend.
-# Arguments:
-#   None
+# cria Redis (docker) e garante Postgres (db/usuário) — idempotente
+# Arguments: None
 #######################################
-backend_set_env() {
+backend_redis_create() {
   print_banner
-  printf "${WHITE} 💻 Configurando variáveis de ambiente (backend)...${GRAY_LIGHT}"
-  printf "\n\n"
+  printf "${WHITE} 💻 Criando Redis & Banco Postgres...${GRAY_LIGHT}\n\n"
+  sleep 2
+
+  # Redis via Docker
+  sudo bash -lc "
+    usermod -aG docker deploy || true
+    if ! docker ps -a --format '{{.Names}}' | grep -q '^redis-${instancia_add}\$'; then
+      docker run --name redis-${instancia_add} \
+        -p ${redis_port}:6379 \
+        --restart always \
+        --detach redis \
+        redis-server --requirepass ${mysql_root_password}
+    else
+      docker start redis-${instancia_add} >/dev/null 2>&1 || true
+    fi
+  "
 
   sleep 2
 
-  # ensure idempotency
+  # Postgres: cria DB/USER se não existirem
+  sudo -u postgres bash -lc "
+    DB_EXISTS=\$(psql -tAc \"SELECT 1 FROM pg_database WHERE datname='${instancia_add}';\")
+    if [ \"\$DB_EXISTS\" != \"1\" ]; then
+      createdb ${instancia_add}
+    fi
+
+    USER_EXISTS=\$(psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='${instancia_add}';\")
+    if [ \"\$USER_EXISTS\" != \"1\" ]; then
+      psql -v ON_ERROR_STOP=1 <<SQL
+CREATE USER ${instancia_add} SUPERUSER INHERIT CREATEDB CREATEROLE LOGIN PASSWORD '${mysql_root_password}';
+SQL
+    else
+      psql -v ON_ERROR_STOP=1 -c \"ALTER USER ${instancia_add} PASSWORD '${mysql_root_password}';\"
+    fi
+  "
+
+  sleep 2
+}
+
+#######################################
+# escreve .env do backend
+# Arguments: None
+#######################################
+backend_set_env() {
+  print_banner
+  printf "${WHITE} 💻 Configurando variáveis de ambiente (backend)...${GRAY_LIGHT}\n\n"
+  sleep 2
+
+  # normaliza URLs => https://dominio
   backend_url=$(echo "${backend_url/https:\/\/}")
   backend_url=${backend_url%%/*}
-  backend_url=https://$backend_url
+  backend_url="https://${backend_url}"
 
-  # ensure idempotency
   frontend_url=$(echo "${frontend_url/https:\/\/}")
   frontend_url=${frontend_url%%/*}
-  frontend_url=https://$frontend_url
+  frontend_url="https://${frontend_url}"
 
-sudo su - deploy << EOF
-  cat <<[-]EOF > /home/deploy/${instancia_add}/backend/.env
-NODE_ENV=
+  _run_as_deploy "
+    cat > /home/deploy/${instancia_add}/backend/.env <<'EOFENV'
+NODE_ENV=production
 BACKEND_URL=${backend_url}
 FRONTEND_URL=${frontend_url}
 PROXY_PORT=443
@@ -73,169 +94,164 @@ JWT_REFRESH_SECRET=${jwt_refresh_secret}
 
 REDIS_URI=redis://:${mysql_root_password}@127.0.0.1:${redis_port}
 REDIS_OPT_LIMITER_MAX=1
-REGIS_OPT_LIMITER_DURATION=3000
+REDIS_OPT_LIMITER_DURATION=3000
 
 USER_LIMIT=${max_user}
 CONNECTIONS_LIMIT=${max_whats}
 CLOSED_SEND_BY_ME=true
-
-[-]EOF
-EOF
+EOFENV
+  "
 
   sleep 2
 }
 
 #######################################
-# installs node.js dependencies
-# Arguments:
-#   None
+# instala dependências do backend
+# Arguments: None
 #######################################
 backend_node_dependencies() {
   print_banner
-  printf "${WHITE} 💻 Instalando dependências do backend...${GRAY_LIGHT}"
-  printf "\n\n"
-
+  printf "${WHITE} 💻 Instalando dependências do backend...${GRAY_LIGHT}\n\n"
   sleep 2
 
-  sudo su - deploy <<EOF
-  cd /home/deploy/${instancia_add}/backend
-  npm install
-EOF
+  _run_as_deploy "
+    cd /home/deploy/${instancia_add}/backend
+    if [ -f package-lock.json ]; then
+      npm ci --force
+    else
+      npm install --force
+    fi
+  "
 
   sleep 2
 }
 
 #######################################
-# compiles backend code
-# Arguments:
-#   None
+# compila backend
+# Arguments: None
 #######################################
 backend_node_build() {
   print_banner
-  printf "${WHITE} 💻 Compilando o código do backend...${GRAY_LIGHT}"
-  printf "\n\n"
-
+  printf "${WHITE} 💻 Compilando o código do backend...${GRAY_LIGHT}\n\n"
   sleep 2
 
-  sudo su - deploy <<EOF
-  cd /home/deploy/${instancia_add}/backend
-  npm run build
-EOF
+  _run_as_deploy "
+    cd /home/deploy/${instancia_add}/backend
+    npm run build
+  "
 
   sleep 2
 }
 
 #######################################
-# updates frontend code
-# Arguments:
-#   None
+# update backend (git pull + build + migrate/seed + pm2)
+# Arguments: None
 #######################################
 backend_update() {
   print_banner
-  printf "${WHITE} 💻 Atualizando o backend...${GRAY_LIGHT}"
-  printf "\n\n"
-
+  printf "${WHITE} 💻 Atualizando o backend...${GRAY_LIGHT}\n\n"
   sleep 2
 
-  sudo su - deploy <<EOF
-  cd /home/deploy/${empresa_atualizar}
-  pm2 stop ${empresa_atualizar}-backend
-  git pull
-  cd /home/deploy/${empresa_atualizar}/backend
-  npm install --force
-  npm update -f
-  npm install @types/fs-extra
-  rm -rf dist 
-  npm run build
-  npx sequelize db:migrate
-  npx sequelize db:seed
-  pm2 start ${empresa_atualizar}-backend
-  pm2 save 
-EOF
+  _run_as_deploy "
+    cd /home/deploy/${empresa_atualizar}
+    pm2 stop ${empresa_atualizar}-backend || true
+    git pull
+    cd /home/deploy/${empresa_atualizar}/backend
+    if [ -f package-lock.json ]; then
+      npm ci --force
+    else
+      npm install --force
+    fi
+    npm update -f || true
+    npm install @types/fs-extra || true
+    rm -rf dist
+    npm run build
+    npx sequelize db:migrate
+    npx sequelize db:seed:all
+    pm2 start /home/deploy/${empresa_atualizar}/backend/dist/server.js --name ${empresa_atualizar}-backend --update-env --time
+    pm2 save
+  "
 
   sleep 2
 }
 
 #######################################
-# runs db migrate
-# Arguments:
-#   None
+# db:migrate
+# Arguments: None
 #######################################
 backend_db_migrate() {
   print_banner
-  printf "${WHITE} 💻 Executando db:migrate...${GRAY_LIGHT}"
-  printf "\n\n"
-
+  printf "${WHITE} 💻 Executando db:migrate...${GRAY_LIGHT}\n\n"
   sleep 2
 
-  sudo su - deploy <<EOF
-  cd /home/deploy/${instancia_add}/backend
-  npx sequelize db:migrate
-EOF
+  _run_as_deploy "
+    cd /home/deploy/${instancia_add}/backend
+    npx sequelize db:migrate
+  "
 
   sleep 2
 }
 
 #######################################
-# runs db seed
-# Arguments:
-#   None
+# db:seed
+# Arguments: None
 #######################################
 backend_db_seed() {
   print_banner
-  printf "${WHITE} 💻 Executando db:seed...${GRAY_LIGHT}"
-  printf "\n\n"
-
+  printf "${WHITE} 💻 Executando db:seed...${GRAY_LIGHT}\n\n"
   sleep 2
 
-  sudo su - deploy <<EOF
-  cd /home/deploy/${instancia_add}/backend
-  npx sequelize db:seed:all
-EOF
+  _run_as_deploy "
+    cd /home/deploy/${instancia_add}/backend
+    npx sequelize db:seed:all
+  "
 
   sleep 2
 }
 
 #######################################
-# starts backend using pm2 in 
-# production mode.
-# Arguments:
-#   None
+# inicia backend no pm2 (production)
+# Arguments: None
 #######################################
 backend_start_pm2() {
   print_banner
-  printf "${WHITE} 💻 Iniciando pm2 (backend)...${GRAY_LIGHT}"
-  printf "\n\n"
-
+  printf "${WHITE} 💻 Iniciando pm2 (backend)...${GRAY_LIGHT}\n\n"
   sleep 2
 
-  sudo su - deploy <<EOF
-  cd /home/deploy/${instancia_add}/backend
-  sudo pm2 start dist/server.js --name ${instancia_add}-backend
-  sudo pm2 save --force
-EOF
+  # cria serviço pm2 do deploy se faltar
+  if [ ! -f /etc/systemd/system/pm2-deploy.service ]; then
+    sudo env PATH=$PATH:/usr/bin \
+      /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u deploy --hp /home/deploy >/dev/null
+  fi
+
+  _run_as_deploy "
+    cd /home/deploy/${instancia_add}/backend
+    pm2 start dist/server.js --name ${instancia_add}-backend --update-env --time
+    pm2 save
+  "
+
+  sudo systemctl enable pm2-deploy.service >/dev/null 2>&1 || true
+  sudo systemctl start  pm2-deploy.service >/dev/null 2>&1 || true
 
   sleep 2
 }
 
 #######################################
-# updates frontend code
-# Arguments:
-#   None
+# configura Nginx para backend (reverse-proxy)
+# Arguments: None
 #######################################
 backend_nginx_setup() {
   print_banner
-  printf "${WHITE} 💻 Configurando nginx (backend)...${GRAY_LIGHT}"
-  printf "\n\n"
-
+  printf "${WHITE} 💻 Configurando nginx (backend)...${GRAY_LIGHT}\n\n"
   sleep 2
 
   backend_hostname=$(echo "${backend_url/https:\/\/}")
 
-sudo su - root << EOF
-cat > /etc/nginx/sites-available/${instancia_add}-backend << 'END'
+  sudo bash -lc "
+cat > /etc/nginx/sites-available/${instancia_add}-backend <<EOF
 server {
-  server_name $backend_hostname;
+  server_name ${backend_hostname};
+
   location / {
     proxy_pass http://127.0.0.1:${backend_port};
     proxy_http_version 1.1;
@@ -248,9 +264,11 @@ server {
     proxy_cache_bypass \$http_upgrade;
   }
 }
-END
-ln -s /etc/nginx/sites-available/${instancia_add}-backend /etc/nginx/sites-enabled
 EOF
+
+ln -sf /etc/nginx/sites-available/${instancia_add}-backend /etc/nginx/sites-enabled/${instancia_add}-backend
+nginx -t && systemctl reload nginx
+"
 
   sleep 2
 }
